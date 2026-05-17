@@ -1,7 +1,9 @@
 export class Kmtronic {
   #status = "disconnected";
-  #relays = new Array(8).fill(null); // null = desconocido, true = cerrado, false = abierto
-  #send = null; // inyectado por DeviceManager
+  #relays = new Array(8).fill(null); // null=desconocido, true=ON, false=OFF
+  #send = null;                       // inyectado por DeviceManager
+  #pendingResolve = null;             // resolver de la promesa en espera
+  #pendingTimeout = null;
 
   constructor({ id, ip, port }) {
     this.id = id;
@@ -9,61 +11,79 @@ export class Kmtronic {
     this.port = port;
   }
 
-  // Inyectado por DeviceManager — no llamar directamente
   _setSendFn(fn) {
     this.#send = fn;
   }
 
-  // Llamado por DeviceManager cuando llega un mensaje UDP de esta IP
-  onMessage(data) {
+  // Llamado por DeviceManager cuando llega un paquete UDP de esta IP.
+  // El dispositivo responde con un string ASCII de 8 dígitos: "10100000"
+  // donde cada posición [0..7] es el relé 1..8 (0=OFF, 1=ON).
+  onMessage(raw) {
     this.#status = "connected";
 
-    // El KMTronic responde al query FF0000 con un buffer donde
-    // cada byte representa el estado de un relé: 0x00=abierto, 0x01=cerrado
-    // Ejemplo: si relé 1 y 3 están cerrados → [1, 0, 1, 0, 0, 0, 0, 0]
-    if (Buffer.isBuffer(data)) {
-      this.#parseRelayStatus(data);
-    } else {
-      // Si llega como string, convertir
-      const buf = Buffer.from(data, "binary");
-      if (buf.length >= 8) {
-        this.#parseRelayStatus(buf);
+    const str = (Buffer.isBuffer(raw) ? raw.toString("ascii") : String(raw)).trim();
+
+    if (/^[01]{8}$/.test(str)) {
+      for (let i = 0; i < 8; i++) {
+        this.#relays[i] = str[i] === "1";
       }
+      console.log(`[${this.id}] <- UDP "${str}"`);
+    } else {
+      console.warn(`[${this.id}] <- UDP payload inesperado: "${str}"`);
     }
 
-    console.log(`[${this.id}] estado relés:`, this.#relays.map((v, i) =>
-      `R${i + 1}:${v === null ? "?" : v ? "ON" : "OFF"}`
-    ).join(" "));
-  }
-
-  #parseRelayStatus(buf) {
-    for (let i = 0; i < 8 && i < buf.length; i++) {
-      this.#relays[i] = buf[i] === 0x01;
+    // Resolver la promesa pendiente (setRelay/queryStatus esperando)
+    if (this.#pendingResolve) {
+      clearTimeout(this.#pendingTimeout);
+      const resolve = this.#pendingResolve;
+      this.#pendingResolve = null;
+      this.#pendingTimeout = null;
+      resolve(this.#buildRelayList());
     }
   }
 
-  // Pregunta el estado de todos los relés → responde con 8 bytes
+  // Devuelve una Promise que se resuelve cuando llega la respuesta UDP.
+  // Si el dispositivo no contesta en timeoutMs, rechaza.
+  #awaitResponse(timeoutMs = 3000) {
+    return new Promise((resolve, reject) => {
+      if (this.#pendingTimeout) {
+        clearTimeout(this.#pendingTimeout);
+        if (this.#pendingResolve) this.#pendingResolve(this.#buildRelayList());
+      }
+      this.#pendingResolve = resolve;
+      this.#pendingTimeout = setTimeout(() => {
+        this.#pendingResolve = null;
+        this.#pendingTimeout = null;
+        reject(new Error(`timeout: ${this.id} no respondio en ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
+  }
+
+  // Query de estado: FF 00 00
   queryStatus() {
-    if (!this.#send) {
-      console.error(`[${this.id}] sin función de envío`);
-      return;
-    }
-    const cmd = Buffer.from([0xFF, 0x00, 0x00]);
-    this.#send(cmd);
-    console.log(`[${this.id}] query estado enviado`);
+    if (!this.#send) throw new Error(`[${this.id}] sin funcion de envio`);
+    const promise = this.#awaitResponse();
+    this.#send(Buffer.from([0xff, 0x00, 0x00]));
+    console.log(`[${this.id}] -> UDP query FF0000`);
+    return promise;
   }
 
-  // Controla un relé: relay 1-8, state true=cerrado false=abierto
-  // Formato: FF 0y 0x  donde y=relé (1-8), x=estado (1=ON, 0=OFF)
+  // Comando de rele: FF 0y 0x  (y=rele 1-8, x=0 OFF / 1 ON)
+  // Retorna Promise<relays[]> que se resuelve cuando el dispositivo confirma.
   setRelay(relay, state) {
-    if (relay < 1 || relay > 8) throw new Error("Relé debe ser 1-8");
-    if (!this.#send) {
-      console.error(`[${this.id}] sin función de envío`);
-      return;
-    }
-    const cmd = Buffer.from([0xFF, relay, state ? 0x01 : 0x00]);
-    this.#send(cmd);
-    console.log(`[${this.id}] relé ${relay} → ${state ? "ON" : "OFF"}`);
+    if (relay < 1 || relay > 8) throw new Error("Rele debe ser 1-8");
+    if (!this.#send) throw new Error(`[${this.id}] sin funcion de envio`);
+    const promise = this.#awaitResponse();
+    this.#send(Buffer.from([0xff, relay, state ? 0x01 : 0x00]));
+    console.log(`[${this.id}] -> UDP rele ${relay} ${state ? "ON" : "OFF"}`);
+    return promise;
+  }
+
+  #buildRelayList() {
+    return this.#relays.map((v, i) => ({
+      relay: i + 1,
+      state: v === null ? "unknown" : v ? "on" : "off",
+    }));
   }
 
   getStatus() {
@@ -72,10 +92,7 @@ export class Kmtronic {
       ip: this.ip,
       port: this.port,
       status: this.#status,
-      relays: this.#relays.map((v, i) => ({
-        relay: i + 1,
-        state: v === null ? "unknown" : v ? "on" : "off"
-      }))
+      relays: this.#buildRelayList(),
     };
   }
 }

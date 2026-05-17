@@ -1,6 +1,6 @@
 export class DeviceManager {
-  #devices = new Map();   // id -> Device
-  #byIp = new Map();      // ip -> Device
+  #devices = new Map();
+  #byIp = new Map();
   #udpServer;
   #pollInterval = null;
 
@@ -15,14 +15,12 @@ export class DeviceManager {
   }
 
   add(device) {
-    // Inyectar función de envío al dispositivo
     device._setSendFn((buf) => {
       this.#udpServer.send(buf, device.ip, device.port);
     });
-
     this.#devices.set(device.id, device);
     this.#byIp.set(device.ip, device);
-    console.log(`[DeviceManager] dispositivo añadido: ${device.id} (${device.ip})`);
+    console.log(`[DeviceManager] añadido: ${device.id} (${device.ip}:${device.port})`);
   }
 
   remove(id) {
@@ -30,42 +28,38 @@ export class DeviceManager {
     if (!device) return;
     this.#byIp.delete(device.ip);
     this.#devices.delete(id);
-    console.log(`[DeviceManager] dispositivo eliminado: ${id}`);
   }
 
   get(id) { return this.#devices.get(id); }
   list() { return [...this.#devices.values()].map(d => d.getStatus()); }
 
-  // Inicia el poller: cada 30s pregunta el estado a todos los devices
-  // de forma secuencial (uno tras otro con un pequeño delay entre ellos)
+  // Polling secuencial: espera la respuesta UDP de cada device antes de
+  // pasar al siguiente (gracias a que queryStatus ahora devuelve Promise).
   startPolling(intervalMs = 30000, delayBetweenMs = 500) {
-    if (this.#pollInterval) return; // ya está corriendo
+    if (this.#pollInterval) return;
 
     const poll = async () => {
       const devices = [...this.#devices.values()];
-      console.log(`[DeviceManager] polling ${devices.length} dispositivos...`);
-
+      console.log(`[poll] consultando ${devices.length} dispositivo(s)...`);
       for (const device of devices) {
-        if (typeof device.queryStatus === "function") {
-          device.queryStatus();
-          // Pequeña pausa entre queries para no saturar la red
+        try {
+          await device.queryStatus();
+        } catch (e) {
+          console.warn(`[poll] ${device.id}: ${e.message}`);
+        }
+        if (devices.length > 1) {
           await new Promise(r => setTimeout(r, delayBetweenMs));
         }
       }
     };
 
-    // Primera query inmediata al arrancar
-    poll();
-
+    poll(); // primera query inmediata
     this.#pollInterval = setInterval(poll, intervalMs);
-    console.log(`[DeviceManager] polling iniciado cada ${intervalMs / 1000}s`);
+    console.log(`[DeviceManager] polling cada ${intervalMs / 1000}s`);
   }
 
   stopPolling() {
-    if (this.#pollInterval) {
-      clearInterval(this.#pollInterval);
-      this.#pollInterval = null;
-      console.log("[DeviceManager] polling detenido");
-    }
+    clearInterval(this.#pollInterval);
+    this.#pollInterval = null;
   }
 }
