@@ -1,31 +1,44 @@
 {
-  "name": "app",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "brightsign-control",
+  "version": "1.3.0",
+  "description": "Servidor Node.js con panel React para control de relés KMTronic y comandos BrightSign PLAY/STOP UDP independientes en un único bundle JS.",
+  "main": "dist/bundle.js",
+  "type": "commonjs",
   "scripts": {
     "dev": "node main.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node main.js",
+    "dev:web": "vite --host 0.0.0.0",
+    "build:web": "vite build",
+    "build": "node scripts/build.cjs",
+    "start:dist": "node dist/bundle.js"
   },
-  "keywords": [],
+  "keywords": [
+    "kmtronic",
+    "udp",
+    "brightsign",
+    "relay",
+    "express"
+  ],
   "author": "",
   "license": "ISC",
-  "devEngines": {
-    "packageManager": {
-      "name": "pnpm",
-      "version": "^11.1.2",
-      "onFail": "download"
-    }
+  "engines": {
+    "node": ">=14"
   },
-  "type": "module",
   "devDependencies": {
-    "esbuild": "^0.28.0",
-    "eslint": "^10.4.0",
-    "eslint-config-prettier": "^10.1.8",
-    "prettier": "^3.8.3"
+    "@vitejs/plugin-react": "^6.0.2",
+    "esbuild": "^0.27.0",
+    "prettier": "^3.2.5",
+    "vite": "^8.0.14",
+    "vite-plugin-singlefile": "^2.3.3"
   },
   "dependencies": {
-    "express": "^5.2.1",
-    "morgan": "^1.10.1"
-  }
+    "express": "^4.18.3",
+    "morgan": "^1.10.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6"
+  },
+  "packageManager": "pnpm@10.0.0",
+  "pnpm.onlyBuiltDependencies": [
+    "esbuild"
+  ]
 }

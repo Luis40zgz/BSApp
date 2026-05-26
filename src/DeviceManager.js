@@ -1,65 +1,109 @@
-export class DeviceManager {
+/**
+ * Registro y orquestacion de devices KMTronic.
+ *
+ * DeviceManager centraliza:
+ * - alta de instancias KMTronic
+ * - routing de respuestas UDP por IP origen
+ * - polling secuencial para no mezclar respuestas UDP
+ */
+class DeviceManager {
   #devices = new Map();
   #byIp = new Map();
   #udpServer;
   #pollInterval = null;
+  #polling = false;
 
   constructor(udpServer) {
     this.#udpServer = udpServer;
 
-    udpServer.on("message", ({ ip, data }) => {
+    udpServer.on('message', ({ ip, data }) => {
       const device = this.#byIp.get(ip);
-      if (device) device.onMessage(data);
-      else console.warn(`[DeviceManager] mensaje de IP desconocida: ${ip}`);
+
+      if (device) {
+        device.onMessage(data);
+        return;
+      }
+
+      console.warn(`[DeviceManager] mensaje de IP desconocida: ${ip}`);
     });
   }
 
   add(device) {
-    device._setSendFn((buf) => {
-      this.#udpServer.send(buf, device.ip, device.port);
+    device._setSendFn((buffer, overridePort) => {
+      this.#udpServer.send(buffer, device.ip, overridePort || device.port);
     });
+
     this.#devices.set(device.id, device);
     this.#byIp.set(device.ip, device);
+
     console.log(`[DeviceManager] añadido: ${device.id} (${device.ip}:${device.port})`);
   }
 
   remove(id) {
     const device = this.#devices.get(id);
     if (!device) return;
+
     this.#byIp.delete(device.ip);
     this.#devices.delete(id);
   }
 
-  get(id) { return this.#devices.get(id); }
-  list() { return [...this.#devices.values()].map(d => d.getStatus()); }
+  get(id) {
+    return this.#devices.get(id);
+  }
 
-  // Polling secuencial: espera la respuesta UDP de cada device antes de
-  // pasar al siguiente (gracias a que queryStatus ahora devuelve Promise).
-  startPolling(intervalMs = 30000, delayBetweenMs = 500) {
-    if (this.#pollInterval) return;
+  list() {
+    return [...this.#devices.values()].map((device) => device.getStatus());
+  }
 
-    const poll = async () => {
-      const devices = [...this.#devices.values()];
-      console.log(`[poll] consultando ${devices.length} dispositivo(s)...`);
+  /**
+   * Lanza un poll secuencial sobre todos los KMTronic registrados.
+   *
+   * Es secuencial a proposito: KMTronic responde por UDP y conviene evitar
+   * solapamiento de comandos/respuestas cuando hay varios modulos.
+   */
+  async pollOnce(delayBetweenMs = 500) {
+    if (this.#polling) return;
+
+    this.#polling = true;
+    const devices = [...this.#devices.values()];
+
+    console.log(`[poll] consultando ${devices.length} dispositivo(s)...`);
+
+    try {
       for (const device of devices) {
         try {
           await device.queryStatus();
-        } catch (e) {
-          console.warn(`[poll] ${device.id}: ${e.message}`);
+        } catch (error) {
+          console.warn(`[poll] ${device.id}: ${error.message}`);
         }
+
         if (devices.length > 1) {
-          await new Promise(r => setTimeout(r, delayBetweenMs));
+          await new Promise((resolve) => setTimeout(resolve, delayBetweenMs));
         }
       }
-    };
+    } finally {
+      this.#polling = false;
+    }
+  }
 
-    poll(); // primera query inmediata
-    this.#pollInterval = setInterval(poll, intervalMs);
+  startPolling(intervalMs = 30000, delayBetweenMs = 500) {
+    if (this.#pollInterval) return;
+
+    this.pollOnce(delayBetweenMs);
+
+    this.#pollInterval = setInterval(() => {
+      this.pollOnce(delayBetweenMs);
+    }, intervalMs);
+
     console.log(`[DeviceManager] polling cada ${intervalMs / 1000}s`);
   }
 
   stopPolling() {
+    if (!this.#pollInterval) return;
+
     clearInterval(this.#pollInterval);
     this.#pollInterval = null;
   }
 }
+
+module.exports = { DeviceManager };

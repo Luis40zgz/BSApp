@@ -1,8 +1,15 @@
-import dgram from "dgram";
-import EventEmitter from "events";
+const dgram = require('dgram');
+const EventEmitter = require('events');
 
-export class UDPServer extends EventEmitter {
-  #socket;
+/**
+ * Wrapper minimo sobre dgram para KMTronic.
+ *
+ * - Escucha en un puerto local.
+ * - Emite mensajes con IP origen.
+ * - Envia buffers/comandos al host/puerto indicado por cada device.
+ */
+class UDPServer extends EventEmitter {
+  #socket = null;
 
   constructor({ port }) {
     super();
@@ -10,22 +17,36 @@ export class UDPServer extends EventEmitter {
   }
 
   start() {
-    this.#socket = dgram.createSocket("udp4");
+    if (this.#socket) return;
 
-    this.#socket.on("message", (msg, rinfo) => {
-      // emite con la IP origen para que DeviceManager enrute
-      this.emit("message", { ip: rinfo.address, data: msg.toString(), rinfo });
+    this.#socket = dgram.createSocket('udp4');
+
+    this.#socket.on('message', (msg, rinfo) => {
+      this.emit('message', {
+        ip: rinfo.address,
+        data: msg.toString('ascii'),
+        rinfo,
+      });
+    });
+
+    this.#socket.on('error', (error) => {
+      console.error(`[UDPServer] error: ${error.message}`);
+      this.emit('error', error);
     });
 
     this.#socket.bind(this.port, () => {
-      console.log(`UDP escuchando en puerto ${this.port}`);
+      console.log(`[UDPServer] escuchando KMTronic en puerto ${this.port}`);
     });
-
-    this.#socket.on("error", (err) => this.emit("error", err));
   }
 
   send(message, ip, port) {
-    const buf = Buffer.from(message);
-    this.#socket.send(buf, port, ip);
+    if (!this.#socket) {
+      throw new Error('UDPServer no iniciado');
+    }
+
+    const buffer = Buffer.isBuffer(message) ? message : Buffer.from(String(message));
+    this.#socket.send(buffer, port, ip);
   }
 }
+
+module.exports = { UDPServer };

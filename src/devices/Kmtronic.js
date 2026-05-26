@@ -1,9 +1,25 @@
-export class Kmtronic {
+const RELAY_COUNT = 8;
+const RESPONSE_TIMEOUT_MS = 3000;
+
+/**
+ * Modelo de un modulo KMTronic de 8 reles.
+ *
+ * El dispositivo devuelve un payload ASCII de 8 digitos:
+ * - posicion 0 => rele 1
+ * - posicion 7 => rele 8
+ * - '0' => OFF
+ * - '1' => ON
+ */
+class Kmtronic {
   #status = "disconnected";
-  #relays = new Array(8).fill(null); // null=desconocido, true=ON, false=OFF
-  #send = null;                       // inyectado por DeviceManager
-  #pendingResolve = null;             // resolver de la promesa en espera
+  #relays = new Array(RELAY_COUNT).fill(null);
+  #send = null;
+  #pendingResolve = null;
+  #pendingReject = null;
   #pendingTimeout = null;
+  #queue = Promise.resolve();
+  #lastRaw = null;
+  #lastUpdated = null;
 
   constructor({ id, ip, port }) {
     this.id = id;
@@ -11,79 +27,58 @@ export class Kmtronic {
     this.port = port;
   }
 
-  _setSendFn(fn) {
-    this.#send = fn;
+  /**
+   * Inyeccion interna usada por DeviceManager.
+   * Evita que Kmtronic conozca detalles del socket UDP compartido.
+   */
+  _setSendFn(sendFn) {
+    this.#send = sendFn;
   }
 
-  // Llamado por DeviceManager cuando llega un paquete UDP de esta IP.
-  // El dispositivo responde con un string ASCII de 8 dígitos: "10100000"
-  // donde cada posición [0..7] es el relé 1..8 (0=OFF, 1=ON).
+  /**
+   * Procesa una respuesta UDP del modulo.
+   */
   onMessage(raw) {
-    this.#status = "connected";
+    const payload = this.#normalizePayload(raw);
+    const parsedRelays = this.#parseRelayPayload(payload);
 
-    const str = (Buffer.isBuffer(raw) ? raw.toString("ascii") : String(raw)).trim();
-
-    if (/^[01]{8}$/.test(str)) {
-      for (let i = 0; i < 8; i++) {
-        this.#relays[i] = str[i] === "1";
-      }
-      console.log(`[${this.id}] <- UDP "${str}"`);
-    } else {
-      console.warn(`[${this.id}] <- UDP payload inesperado: "${str}"`);
+    if (!parsedRelays) {
+      console.warn(`[${this.id}] <- UDP payload inesperado: "${payload}"`);
+      return;
     }
 
-    // Resolver la promesa pendiente (setRelay/queryStatus esperando)
+    this.#status = "connected";
+    this.#lastRaw = payload;
+    this.#lastUpdated = new Date().toISOString();
+    this.#relays = parsedRelays;
+
+    console.log(`[${this.id}] <- UDP "${payload}"`);
+
     if (this.#pendingResolve) {
       clearTimeout(this.#pendingTimeout);
       const resolve = this.#pendingResolve;
-      this.#pendingResolve = null;
-      this.#pendingTimeout = null;
-      resolve(this.#buildRelayList());
+      this.#clearPending();
+      resolve(this.getStatus());
     }
   }
 
-  // Devuelve una Promise que se resuelve cuando llega la respuesta UDP.
-  // Si el dispositivo no contesta en timeoutMs, rechaza.
-  #awaitResponse(timeoutMs = 3000) {
-    return new Promise((resolve, reject) => {
-      if (this.#pendingTimeout) {
-        clearTimeout(this.#pendingTimeout);
-        if (this.#pendingResolve) this.#pendingResolve(this.#buildRelayList());
-      }
-      this.#pendingResolve = resolve;
-      this.#pendingTimeout = setTimeout(() => {
-        this.#pendingResolve = null;
-        this.#pendingTimeout = null;
-        reject(new Error(`timeout: ${this.id} no respondio en ${timeoutMs}ms`));
-      }, timeoutMs);
+  queryStatus() {
+    return this.#enqueue(() => {
+      console.log(`[${this.id}] -> UDP query FF0000`);
+      return this.#sendCommand("FF0000");
     });
   }
 
-  // Query de estado: FF 00 00
-  queryStatus() {
-    if (!this.#send) throw new Error(`[${this.id}] sin funcion de envio`);
-    const promise = this.#awaitResponse();
-    this.#send(Buffer.from([0xff, 0x00, 0x00]));
-    console.log(`[${this.id}] -> UDP query FF0000`);
-    return promise;
-  }
-
-  // Comando de rele: FF 0y 0x  (y=rele 1-8, x=0 OFF / 1 ON)
-  // Retorna Promise<relays[]> que se resuelve cuando el dispositivo confirma.
   setRelay(relay, state) {
-    if (relay < 1 || relay > 8) throw new Error("Rele debe ser 1-8");
-    if (!this.#send) throw new Error(`[${this.id}] sin funcion de envio`);
-    const promise = this.#awaitResponse();
-    this.#send(Buffer.from([0xff, relay, state ? 0x01 : 0x00]));
-    console.log(`[${this.id}] -> UDP rele ${relay} ${state ? "ON" : "OFF"}`);
-    return promise;
-  }
+    if (relay < 1 || relay > RELAY_COUNT) {
+      throw new Error("Rele debe ser 1-8");
+    }
 
-  #buildRelayList() {
-    return this.#relays.map((v, i) => ({
-      relay: i + 1,
-      state: v === null ? "unknown" : v ? "on" : "off",
-    }));
+    return this.#enqueue(() => {
+      const command = `FF0${relay}0${state ? "1" : "0"}`;
+      console.log(`[${this.id}] -> UDP rele ${relay} ${state ? "ON" : "OFF"}`);
+      return this.#sendCommand(command);
+    });
   }
 
   getStatus() {
@@ -92,7 +87,72 @@ export class Kmtronic {
       ip: this.ip,
       port: this.port,
       status: this.#status,
+      raw: this.#lastRaw,
+      lastUpdated: this.#lastUpdated,
       relays: this.#buildRelayList(),
     };
   }
+
+  #normalizePayload(raw) {
+    if (Buffer.isBuffer(raw)) return raw.toString("ascii").trim();
+    return String(raw ?? "").trim();
+  }
+
+  #parseRelayPayload(payload) {
+    if (!/^[01]{8}$/.test(payload)) return null;
+    return [...payload].map((bit) => bit === "1");
+  }
+
+  #buildRelayList() {
+    return this.#relays.map((value, index) => ({
+      relay: index + 1,
+      state: value === null ? "unknown" : value ? "on" : "off",
+    }));
+  }
+
+  #awaitResponse(timeoutMs = RESPONSE_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+      this.#pendingResolve = resolve;
+      this.#pendingReject = reject;
+      this.#pendingTimeout = setTimeout(() => {
+        this.#status = "disconnected";
+        this.#clearPending();
+        reject(new Error(`timeout: ${this.id} no respondio en ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
+  }
+
+  /**
+   * Cola interna por device.
+   *
+   * Los comandos no se lanzan en paralelo porque las respuestas UDP no incluyen
+   * un identificador de correlacion. Serializar evita aplicar feedback cruzado.
+   */
+  #enqueue(task) {
+    const run = async () => {
+      if (!this.#send) {
+        throw new Error(`[${this.id}] sin funcion de envio`);
+      }
+
+      return task();
+    };
+
+    const next = this.#queue.then(run, run);
+    this.#queue = next.catch(() => undefined);
+    return next;
+  }
+
+  #sendCommand(command) {
+    const responsePromise = this.#awaitResponse();
+    this.#send(Buffer.from(command));
+    return responsePromise;
+  }
+
+  #clearPending() {
+    this.#pendingResolve = null;
+    this.#pendingReject = null;
+    this.#pendingTimeout = null;
+  }
 }
+
+module.exports = { Kmtronic };
